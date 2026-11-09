@@ -1,0 +1,22 @@
+{
+    "name": "lms-plugin-pii-redact",
+    "version": "1.0.0",
+    "description": "LM Studio plugin that redacts PII from prompts before they reach a third-party LLM and restores the originals in the responses.",
+    "main": "index.js",
+    "scripts": {
+        "dev": "lms dev",
+        "push": "lms push",
+        "build": "tsc"
+    },
+    "author": "ludij",
+    "license": "ISC",
+    "dependencies": {
+        "@lmstudio/sdk": "^2.1.0",
+        "openai": "^7.53.0",
+        "zod": "^3.25.76"
+    },
+    "devDependencies": {
+        "@types/node": "^26.6.6",
+        "typescript": "^7.0.2"
+    }
+}

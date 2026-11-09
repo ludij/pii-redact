@@ -1,0 +1,235 @@
+import { type ChatMessage, type PromptPreprocessorController } from "@lmstudio/sdk";
+import { globalConfigSchematics } from "./config";
+import { addEntities, existingIdentifiers } from "./entityStore";
+import { llmDetect, mergeDetections, regexDetect } from "./piiDetector";
+import { redact, validatePlaceholders } from "./redactor";
+import { redactionResultSchema, CONFIRM_SUFFIX, type RedactionResult } from "./types";
+
+// ---------------------------------------------------------------------------
+// Pending confirmation state
+// ---------------------------------------------------------------------------
+
+/**
+ * Stores the redacted prompt while waiting for the user to confirm 
+ * with --c.  This ensures that on confirmation we forward the 
+ * *redacted* text — never the original.
+ */
+let pendingRedactedPrompt: string | null = null;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Attempt one round of LLM + regex detection and produce a validated
+ * RedactionResult. Returns null if the result fails validation.
+ */
+async function attemptDetection(
+  ctl: PromptPreprocessorController,
+  text: string,
+): Promise<RedactionResult | null> {
+  const globalConfig = ctl.getGlobalPluginConfig(globalConfigSchematics);
+  const modelId = globalConfig.get("piiModel").trim();
+
+  // Resolve the model: use the configured identifier or fall back to the
+  // currently loaded model.
+  // Note: the no-argument overload of model() does not accept options, so
+  // abort signal handling is delegated to the llmDetect call itself.
+  const model =
+    modelId.length > 0
+      ? await ctl.client.llm.model(modelId, { signal: ctl.abortSignal })
+      : await ctl.client.llm.model();
+
+  // LLM detection (structured output via Zod — throws on schema violation)
+  const llmResponse = await llmDetect(model, text, ctl.abortSignal);
+
+  // Regex fallback — adds any EMAIL / PHONE the LLM missed
+  const regexSpans = regexDetect(text);
+
+  // Merge: LLM entities first, then any regex-only additions
+  const merged = mergeDetections(llmResponse.entities, regexSpans);
+
+  // Assign identifiers and perform text substitution.
+  // Existing identifiers (from earlier turns) are reused so placeholders
+  // stay consistent across the conversation.
+  const result = redact(text, merged, existingIdentifiers());
+
+  // Validate the final structure and placeholder integrity
+  const parseResult = redactionResultSchema.safeParse(result);
+  if (!parseResult.success) {
+    ctl.debug("RedactionResult schema validation failed", parseResult.error.format());
+    return null;
+  }
+
+  if (!validatePlaceholders(result)) {
+    ctl.debug("Placeholder integrity check failed — some placeholders are missing from redacted text");
+    return null;
+  }
+
+  return result;
+}
+
+/**
+ * Format a human-readable summary of detected entities for the status panel.
+ */
+function formatEntitySummary(result: RedactionResult): string {
+  if (result.entities.length === 0) {
+    return "No PII detected.";
+  }
+  const lines = result.entities.map(
+    e => `  • [[[${e.identifier}]]]  ←  "${e.original}"  (${e.type})`,
+  );
+  return `Detected ${result.entities.length} PII entity(ies):\n${lines.join("\n")}`;
+}
+
+// ---------------------------------------------------------------------------
+// Main preprocessor
+// ---------------------------------------------------------------------------
+
+export async function preprocess(
+  ctl: PromptPreprocessorController,
+  userMessage: ChatMessage,
+): Promise<string | ChatMessage> {
+  const rawText = userMessage.getText();
+
+  // ------------------------------------------------------------------
+  // Confirmation gate: if the user sent --c, forward the *redacted*
+  // text — never the original.
+  // ------------------------------------------------------------------
+  if (rawText === CONFIRM_SUFFIX) {
+    if (pendingRedactedPrompt === null) {
+
+      ctl.createStatus({
+        status: "error",
+        text: "No pending redaction to confirm. Please send your prompt first.",
+      });
+
+      throw new Error(
+        "No pending redaction to confirm. Please send your prompt first.",
+      );
+    }
+
+    const redactedText = pendingRedactedPrompt;
+
+    // Clear pending state now that confirmation has been consumed.
+    pendingRedactedPrompt = null;
+
+    const confirmStatus = ctl.createStatus({
+      status: "done",
+      text: "PII redaction confirmed — forwarding redacted prompt.",
+    });
+    ctl.debug("User confirmed redacted prompt. Forwarding saved redacted text.");
+    // Suppress unused variable warning — status is shown in the UI
+    void confirmStatus;
+    return redactedText;
+  }
+
+  const globalConfig = ctl.getGlobalPluginConfig(globalConfigSchematics);
+  const skipConfirmation = globalConfig.get("skipConfirmation");
+
+  // ------------------------------------------------------------------
+  // Detection status
+  // ------------------------------------------------------------------
+  const detectionStatus = ctl.createStatus({
+    status: "loading",
+    text: "Detecting PII in prompt…",
+  });
+
+  let result: RedactionResult | null = null;
+
+  // Attempt 1
+  try {
+    result = await attemptDetection(ctl, rawText);
+  } catch (err) {
+    ctl.debug("PII detection attempt 1 failed", err);
+  }
+
+  // Attempt 2 (retry once on failure)
+  if (result === null) {
+    detectionStatus.setState({
+      status: "loading",
+      text: "PII detection failed — retrying…",
+    });
+    try {
+      result = await attemptDetection(ctl, rawText);
+    } catch (err) {
+      ctl.debug("PII detection attempt 2 failed", err);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Fallback handling — always abort. The original prompt is never
+  // forwarded when detection fails, so unredacted PII can never reach
+  // the third-party model.
+  // ------------------------------------------------------------------
+  if (result === null) {
+    detectionStatus.setState({
+      status: "error",
+      text:
+        "PII detection failed after retry. Request aborted. " +
+        "Check that a model is loaded and try again.",
+    });
+    throw new Error(
+      "PII detection failed after one retry. Request aborted — the original prompt is never forwarded.",
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Success path
+  // ------------------------------------------------------------------
+  const entitySummary = formatEntitySummary(result);
+
+  if (result.entities.length === 0) {
+    // No PII found — pass through without modification
+    detectionStatus.setState({
+      status: "done",
+      text: "No PII detected — forwarding original prompt.",
+    });
+    return userMessage;
+  }
+
+  // ------------------------------------------------------------------
+  // Register entities in the shared store so the generator can
+  // un-redact responses and re-redact the history later.
+  // ------------------------------------------------------------------
+  addEntities(result.entities);
+
+  // ------------------------------------------------------------------
+  // Skip confirmation — forward the redacted text immediately
+  // ------------------------------------------------------------------
+  if (skipConfirmation) {
+    detectionStatus.setState({
+      status: "done",
+      text: `PII redacted successfully — forwarding without confirmation.\n\n${entitySummary}`,
+    });
+    ctl.debug("Redaction result", result);
+    return result.redacted_text;
+  }
+
+  // ------------------------------------------------------------------
+  // Confirmation gate (default)
+  // ------------------------------------------------------------------
+  // Save the redacted prompt so the --c handler can forward
+  // the redacted version (never the original).
+  pendingRedactedPrompt = result.redacted_text;
+
+  // Truncate the redacted text preview to avoid flooding the status panel
+  const preview =
+    result.redacted_text.length > 500
+      ? result.redacted_text.slice(0, 500) + "…"
+      : result.redacted_text;
+
+  detectionStatus.setState({
+    status: "canceled",
+    text:
+      `PII detected — redaction preview shown below. ` +
+      `Send another message containing '--c' to confirm and proceed.\n\n` +
+      `--- Redacted prompt ---\n${preview}\n\n` +
+      `--- Entity map ---\n${entitySummary}`,
+  });
+
+  throw new Error(
+    "Prompt contains PII. Review the redacted preview in the status panel, then confirm " +
+    "your message with --c to proceed.",
+  );
+}
