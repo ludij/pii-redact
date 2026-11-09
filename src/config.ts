@@ -6,6 +6,24 @@ import { createConfigSchematics } from "@lmstudio/sdk";
  */
 export const globalConfigSchematics = createConfigSchematics()
   // -------------------------------------------------------------------------
+  // Detection engine
+  // -------------------------------------------------------------------------
+  .field(
+    "detectionEngine",
+    "select",
+    {
+      displayName: "Detection Engine",
+      subtitle:
+        "'redact' uses the on-device Desert Ant Redact model (recommended — no LLM needed, " +
+        "weights download on first use). 'llm' uses the PII Detection Model for detection.",
+      options: [
+        { value: "redact", displayName: "Redact (on-device model)" },
+        { value: "llm", displayName: "LLM (PII Detection Model)" },
+      ],
+    },
+    "redact",
+  )
+  // -------------------------------------------------------------------------
   // PII detection model
   // -------------------------------------------------------------------------
   .field(
@@ -14,8 +32,8 @@ export const globalConfigSchematics = createConfigSchematics()
     {
       displayName: "PII Detection Model",
       subtitle:
-        "Model identifier used to detect PII. Leave blank to use the currently loaded model. " +
-        "Example: qwen2.5-7b-instruct",
+        "Only used when Detection Engine is 'llm'. Model identifier used to detect PII. " +
+        "Leave blank to use the currently loaded model. Example: qwen2.5-7b-instruct",
       placeholder: "e.g. qwen2.5-7b-instruct",
     },
     "",

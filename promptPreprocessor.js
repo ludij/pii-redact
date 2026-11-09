@@ -19,29 +19,38 @@ let pendingRedactedPrompt = null;
 // Helpers
 // ---------------------------------------------------------------------------
 /**
- * Attempt one round of LLM + regex detection and produce a validated
- * RedactionResult. Returns null if the result fails validation.
+ * Attempt one round of detection and produce a validated RedactionResult.
+ * Returns null if the result fails validation.
  */
 async function attemptDetection(ctl, text) {
     const globalConfig = ctl.getGlobalPluginConfig(config_1.globalConfigSchematics);
-    const modelId = globalConfig.get("piiModel").trim();
-    // Resolve the model: use the configured identifier or fall back to the
-    // currently loaded model.
-    // Note: the no-argument overload of model() does not accept options, so
-    // abort signal handling is delegated to the llmDetect call itself.
-    const model = modelId.length > 0
-        ? await ctl.client.llm.model(modelId, { signal: ctl.abortSignal })
-        : await ctl.client.llm.model();
-    // LLM detection (structured output via Zod — throws on schema violation)
-    const llmResponse = await (0, piiDetector_1.llmDetect)(model, text, ctl.abortSignal);
-    // Regex fallback — adds any EMAIL / PHONE the LLM missed
-    const regexSpans = (0, piiDetector_1.regexDetect)(text);
-    // Merge: LLM entities first, then any regex-only additions
-    const merged = (0, piiDetector_1.mergeDetections)(llmResponse.entities, regexSpans);
+    const detectionEngine = globalConfig.get("detectionEngine");
+    let spans;
+    if (detectionEngine === "llm") {
+        const modelId = globalConfig.get("piiModel").trim();
+        // Resolve the model: use the configured identifier or fall back to the
+        // currently loaded model.
+        // Note: the no-argument overload of model() does not accept options, so
+        // abort signal handling is delegated to the llmDetect call itself.
+        const model = modelId.length > 0
+            ? await ctl.client.llm.model(modelId, { signal: ctl.abortSignal })
+            : await ctl.client.llm.model();
+        // LLM detection (structured output via Zod — throws on schema violation)
+        const llmResponse = await (0, piiDetector_1.llmDetect)(model, text, ctl.abortSignal);
+        // Regex fallback — adds any EMAIL / PHONE the LLM missed
+        const regexSpans = (0, piiDetector_1.regexDetect)(text);
+        // Merge: LLM entities first, then any regex-only additions
+        spans = (0, piiDetector_1.mergeDetections)(llmResponse.entities, regexSpans);
+    }
+    else {
+        // On-device Redact model — deterministic, includes built-in pattern
+        // recognisers for structured data (emails, phones, cards, IBANs).
+        spans = await (0, piiDetector_1.redactDetect)(text);
+    }
     // Assign identifiers and perform text substitution.
     // Existing identifiers (from earlier turns) are reused so placeholders
     // stay consistent across the conversation.
-    const result = (0, redactor_1.redact)(text, merged, (0, entityStore_1.existingIdentifiers)());
+    const result = (0, redactor_1.redact)(text, spans, (0, entityStore_1.existingIdentifiers)());
     // Validate the final structure and placeholder integrity
     const parseResult = types_1.redactionResultSchema.safeParse(result);
     if (!parseResult.success) {
@@ -103,11 +112,13 @@ async function preprocess(ctl, userMessage) {
         text: "Detecting PII in prompt…",
     });
     let result = null;
+    let lastError = null;
     // Attempt 1
     try {
         result = await attemptDetection(ctl, rawText);
     }
     catch (err) {
+        lastError = err;
         ctl.debug("PII detection attempt 1 failed", err);
     }
     // Attempt 2 (retry once on failure)
@@ -120,6 +131,7 @@ async function preprocess(ctl, userMessage) {
             result = await attemptDetection(ctl, rawText);
         }
         catch (err) {
+            lastError = err;
             ctl.debug("PII detection attempt 2 failed", err);
         }
     }
@@ -129,12 +141,19 @@ async function preprocess(ctl, userMessage) {
     // the third-party model.
     // ------------------------------------------------------------------
     if (result === null) {
+        const detail = lastError instanceof Error
+            ? lastError.message
+            : lastError !== null
+                ? String(lastError)
+                : "detection returned an invalid result (see debug logs)";
         detectionStatus.setState({
             status: "error",
-            text: "PII detection failed after retry. Request aborted. " +
-                "Check that a model is loaded and try again.",
+            text: `PII detection failed after retry. Request aborted.\n` +
+                `Engine: ${globalConfig.get("detectionEngine")}\n` +
+                `Reason: ${detail}`,
         });
-        throw new Error("PII detection failed after one retry. Request aborted — the original prompt is never forwarded.");
+        throw new Error(`PII detection failed after one retry. Request aborted — the original prompt is never forwarded. ` +
+            `Reason: ${detail}`);
     }
     // ------------------------------------------------------------------
     // Success path

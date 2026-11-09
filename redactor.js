@@ -20,7 +20,7 @@ function buildPlaceholder(identifier) {
 }
 /**
  * Build a deterministic identifier key for a (type, counter) pair.
- * e.g. ("PERSON", 1) → "PERSON_1"
+ * e.g. ("GIVEN_NAME", 1) → "GIVEN_NAME_1"
  */
 function buildIdentifier(type, n) {
     return `${type}_${n}`;
@@ -35,7 +35,9 @@ function buildIdentifier(type, n) {
 function startingCounters(existing) {
     const maxima = new Map();
     for (const identifier of existing.values()) {
-        const match = /^([A-Z]+)_(\d+)$/.exec(identifier);
+        // Labels may contain underscores (e.g. "GIVEN_NAME_1"), so the type part
+        // is matched with [A-Z_]+ and the trailing counter with _\d+.
+        const match = /^([A-Z_]+)_(\d+)$/.exec(identifier);
         if (match === null) {
             continue;
         }

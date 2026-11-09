@@ -19,7 +19,7 @@ export function buildPlaceholder(identifier: string): string {
 
 /**
  * Build a deterministic identifier key for a (type, counter) pair.
- * e.g. ("PERSON", 1) → "PERSON_1"
+ * e.g. ("GIVEN_NAME", 1) → "GIVEN_NAME_1"
  */
 function buildIdentifier(type: PiiType, n: number): string {
   return `${type}_${n}`;
@@ -45,7 +45,9 @@ interface RawEntity {
 function startingCounters(existing: Map<string, string>): Array<[PiiType, number]> {
   const maxima = new Map<PiiType, number>();
   for (const identifier of existing.values()) {
-    const match = /^([A-Z]+)_(\d+)$/.exec(identifier);
+    // Labels may contain underscores (e.g. "GIVEN_NAME_1"), so the type part
+    // is matched with [A-Z_]+ and the trailing counter with _\d+.
+    const match = /^([A-Z_]+)_(\d+)$/.exec(identifier);
     if (match === null) {
       continue;
     }
